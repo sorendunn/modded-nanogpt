@@ -1,7 +1,53 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
+
+QUICK_TEST_MODE = os.environ.get("QUICK_TEST_MODE", "0") == "1"
+QUICK_TEST_STEPS = int(os.environ.get("QUICK_TEST_STEPS", "2")) if QUICK_TEST_MODE else None
+
+
+def apply_quick_test_overrides(args):
+    if not QUICK_TEST_MODE:
+        return args
+    args.num_iterations = QUICK_TEST_STEPS
+    args.num_scheduled_iterations = QUICK_TEST_STEPS
+    args.num_extension_iterations = 0
+    args.val_loss_every = 0
+    args.val_tokens = 262144
+    args.val_batch_size = 64 * 1024
+    args.train_bs_schedule = (2048 * 8, 2048 * 8, 2048 * 8)
+    args.train_bs_extension = 2048 * 8
+    return args
+
+
+def get_quick_test_world_size_ok(world_size):
+    return QUICK_TEST_MODE and world_size == 1
+
+
+def get_grad_accum_steps(world_size):
+    if QUICK_TEST_MODE:
+        return 1
+    return 8 // world_size
+
+
+def get_quick_test_warmup_steps(transition_steps):
+    if QUICK_TEST_MODE:
+        return [0]
+    return sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0))
+
+
+def print_quick_test_success(print0_fn):
+    if not QUICK_TEST_MODE:
+        return
+    print0_fn("", console=True)
+    print0_fn("=" * 50, console=True)
+    print0_fn("QUICK TEST COMPLETED SUCCESSFULLY", console=True)
+    print0_fn("=" * 50, console=True)
+    print0_fn("The training code runs correctly on single GPU.", console=True)
+    print0_fn("Proceed to full 8-GPU evaluation.", console=True)
 
 # -----------------------------------------------------------------------------
 # Triton kernel for symmetric matrix multiplication by @byronxu99
