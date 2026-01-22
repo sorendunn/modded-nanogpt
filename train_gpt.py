@@ -34,7 +34,11 @@ import torch.nn.functional as F
 from kernels import get_kernel
 from torch import Tensor, nn
 
-from triton_kernels import XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy
+from triton_kernels import (
+    XXT, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy,
+    QUICK_TEST_MODE, apply_quick_test_overrides, get_quick_test_world_size_ok,
+    get_grad_accum_steps, get_quick_test_warmup_steps, print_quick_test_success
+)
 
 dynamo.config.recompile_limit = 64
 
@@ -1167,6 +1171,23 @@ class GPT(nn.Module):
         nn.init.normal_(self.lm_head.weight, mean=0, std=0.005)
         self.lm_head.weight.label = 'lm_head'
 
+        self.vertical_attn_q = nn.Linear(model_dim, model_dim, bias=False)
+        self.vertical_attn_k = nn.Linear(model_dim, model_dim, bias=False)
+        self.vertical_attn_v = nn.Linear(model_dim, model_dim, bias=False)
+        self.vertical_attn_proj = nn.Linear(model_dim, model_dim, bias=False)
+        for param in self.vertical_attn_q.parameters():
+            param.label = 'vertical_attn_q'
+        for param in self.vertical_attn_k.parameters():
+            param.label = 'vertical_attn_k'
+        for param in self.vertical_attn_v.parameters():
+            param.label = 'vertical_attn_v'
+        for param in self.vertical_attn_proj.parameters():
+            param.label = 'vertical_attn_proj'
+        self.vertical_attn_gate = nn.Parameter(torch.tensor(-3.0))
+        self.vertical_attn_gate.label = 'vertical_attn_gate'
+        self.vertical_attn_alibi = nn.Parameter(torch.tensor(-0.75))
+        self.vertical_attn_alibi.label = 'vertical_attn_alibi'
+
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.embed.weight.label = 'embed'
         with torch.no_grad():
@@ -1208,6 +1229,7 @@ class GPT(nn.Module):
         skip_out = [6] # no attn op on layer 6
         x_backout = None
         backout_layer = 7
+        vertical_attn_layers = []
 
         # set lambdas
         resid_lambdas = self.scalars[: 1 * self.num_layers]
@@ -1241,6 +1263,18 @@ class GPT(nn.Module):
         x = torch.cat([x[:1], x[1:] + smear_gate_out * x[:-1]])
         x = x0 = norm(x[None])
 
+        # compute token positions and masks for vertical attention
+        doc_start_idx = seqlens[:-1].to(torch.long)
+        doc_end_idx = seqlens[1:].to(torch.long)
+        max_seq_idx = x.size(1) - 1
+        valid_doc_mask = (doc_end_idx > doc_start_idx) & (doc_end_idx <= x.size(1))
+        doc_last_idx = (doc_end_idx - 1).clamp(min=0, max=max_seq_idx)
+        vertical_attn_pool_tokens_count = 4
+        vertical_attn_offsets = torch.arange(vertical_attn_pool_tokens_count, device=doc_last_idx.device)
+        vertical_attn_positions = doc_last_idx[:, None] - vertical_attn_offsets[None, :]
+        vertical_attn_pos_mask = vertical_attn_positions >= doc_start_idx[:, None]
+        vertical_attn_positions = vertical_attn_positions.clamp(min=0)
+
         # unbind gate banks to avoid select_backwards kernel
         ag = [w.bfloat16() for w in self.attn_gate_bank.unbind(0)] 
         veg = [w.bfloat16() for w in self.ve_gate_bank.unbind(0)]
@@ -1271,9 +1305,15 @@ class GPT(nn.Module):
                 x = x + skip_gate_out * skip_connections.pop()
             if i == 0:
                 x = (resid_lambdas[0] + x0_lambdas[0]) * x + bigram_lambdas[0] * x0_bigram
+                vertical_attn_tokens = x[0, vertical_attn_positions, :]
+                vertical_attn_tokens = vertical_attn_tokens * vertical_attn_pos_mask[..., None].to(vertical_attn_tokens.dtype)
+                token_counts = vertical_attn_pos_mask.sum(dim=1).clamp(min=1).to(vertical_attn_tokens.dtype)
+                vertical_attn_mean = vertical_attn_tokens.sum(dim=1) / token_counts[:, None]
+                vertical_attn_mean = vertical_attn_mean * valid_doc_mask[:, None].to(vertical_attn_mean.dtype)
+                vertical_attn_layers.append(vertical_attn_mean[None])
             else:
                 x = resid_lambdas[i] * x + x0_lambdas[i] * x0 + bigram_lambdas[i] * x0_bigram
-            
+
             # Get weights for this layer from banks
             qkvo_w = attn_weights[self.layer_to_attn_idx[i]] if i in self.layer_to_attn_idx else None
             c_fc = mlp_fcs[self.layer_to_mlp_idx[i]] if i in self.layer_to_mlp_idx else None
@@ -1284,6 +1324,32 @@ class GPT(nn.Module):
                 skip_connections.append(x)
             if i == backout_layer:
                 x_backout = x
+
+            vertical_attn_tokens = x[0, vertical_attn_positions, :]
+            vertical_attn_tokens = vertical_attn_tokens * vertical_attn_pos_mask[..., None].to(vertical_attn_tokens.dtype)
+            token_counts = vertical_attn_pos_mask.sum(dim=1).clamp(min=1).to(vertical_attn_tokens.dtype)
+            vertical_attn_mean = vertical_attn_tokens.sum(dim=1) / token_counts[:, None]
+            vertical_attn_mean = vertical_attn_mean * valid_doc_mask[:, None].to(vertical_attn_mean.dtype)
+            vertical_attn_layers.append(vertical_attn_mean[None])
+
+        # apply vertical attention
+        vertical_attn_stack = torch.stack(vertical_attn_layers, dim=2).squeeze(0)
+        vertical_attn_stack = norm(vertical_attn_stack)
+        q = self.vertical_attn_q(vertical_attn_stack[:, -1:, :])
+        k = self.vertical_attn_k(vertical_attn_stack)
+        v = self.vertical_attn_v(vertical_attn_stack)
+        attn_scores = torch.matmul(q, k.transpose(-1, -2)) * (q.size(-1) ** -0.5)
+        layer_idx = torch.arange(vertical_attn_stack.size(1), device=vertical_attn_stack.device, dtype=attn_scores.dtype)
+        alibi_bias = (layer_idx - (vertical_attn_stack.size(1) - 1)) * self.vertical_attn_alibi
+        attn_scores = attn_scores + alibi_bias[None, None, :]
+        attn_probs = torch.softmax(attn_scores, dim=-1)
+        context = torch.matmul(attn_probs, v)
+        vertical_update = self.vertical_attn_proj(context).squeeze(1)
+        vertical_attn_gate = torch.sigmoid(self.vertical_attn_gate)
+        x0_view = x[0]
+        vertical_attn_update = torch.zeros_like(x0_view)
+        vertical_attn_update.index_add_(0, doc_last_idx, vertical_attn_gate * vertical_update * valid_doc_mask[:, None].to(vertical_update.dtype))
+        x = x + vertical_attn_update[None]
 
         # back out contributions from first 7 layers that are only required for downstream context and not direct prediction
         x -= backout_lambda * x_backout
@@ -1568,7 +1634,7 @@ class TrainingManager():
     def __init__(self, model):
         self.mtp_weights_schedule = self._build_mtp_schedule()
         self.model = model
-        
+
         # - Ordering dictates when to launch reduce/reduce_scatter operations
         # - "sharded" parameters use reduce_scatter/all_gather and "replicated" ones use all_reduce
         # - lr_mul and wd_mul are per-parameter learning rate and weight decay multipliers
@@ -1580,6 +1646,12 @@ class TrainingManager():
             "ve1":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "ve2":            {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "bigram_embed":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
+            "vertical_attn_q":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99]},
+            "vertical_attn_k":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99]},
+            "vertical_attn_v":  {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.9,  0.99]},
+            "vertical_attn_proj":  {"optim": "adam", "comms": "sharded",    "adam_betas": [0.9,  0.99]},
+            "vertical_attn_gate": {"optim": "adam","comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01},
+            "vertical_attn_alibi": {"optim": "adam","comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01},
             "smear_gate":     {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.01, "wd_mul": 0.0},
             "skip_gate":      {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99], "lr_mul": 0.05, "wd_mul": 0.0},
             "attn_gate_bank": {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.99]},
@@ -1592,20 +1664,20 @@ class TrainingManager():
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas",  # Small, fast
-            "ve0", "ve1", "ve2", "bigram_embed",  # Medium
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "x0_lambdas", "vertical_attn_gate", "vertical_attn_alibi", # Small, fast
+            "ve0", "ve1", "ve2", "bigram_embed", "vertical_attn_q", "vertical_attn_k", "vertical_attn_v", "vertical_attn_proj",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn", "mlp",        # Large, polar express - process last to maximize overlap
         ]
 
         adam_defaults = dict(
-            lr=0.008,
+            lr=0.009,
             eps=1e-10,
             weight_decay=0.005,
         )
         
         normuon_defaults = dict(
-            lr=0.023,
+            lr=0.026,
             momentum=0.95,
             beta2=0.95,
             weight_decay=1.2,
@@ -1664,6 +1736,13 @@ class TrainingManager():
                 ws_long = new_ws_long
         return transition_steps
 
+    def get_seq_len(self, step: int):
+        x = step / args.num_scheduled_iterations
+        for i, frac in enumerate(args.len_schedule_fracs):
+            if x < frac:
+                return args.train_len_schedule[i]
+        return args.train_len_schedule[-1]
+
     def advance_schedule(self, step: int):
         self.ws_short, new_ws_long = get_ws(step)
         if new_ws_long != self.ws_long:
@@ -1671,7 +1750,10 @@ class TrainingManager():
             self.model.yarn_paired_head.apply(self.ws_long, new_ws_long)
 
         new_batch_size = get_bs(step)
-        if new_batch_size != self.batch_size:
+        new_len = self.get_seq_len(step)
+        
+        if new_batch_size != self.batch_size or new_len != args.train_max_seq_len:
+            args.train_max_seq_len = new_len
             self.train_loader_send_args = (new_batch_size, args.train_max_seq_len, grad_accum_steps)
             self.batch_size = new_batch_size
         else:
@@ -1707,6 +1789,7 @@ class TrainingManager():
 
         self.ws_short, self.ws_long = get_ws(0)
         self.batch_size = get_bs(0)
+        args.train_max_seq_len = self.get_seq_len(0)
         self.model.yarn.reset()
         self.model.yarn_paired_head.reset()
 
@@ -1723,15 +1806,15 @@ class Hyperparameters:
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     # batch sizes
-    train_bs_schedule: tuple = (8 * 2048 * 8, 16 * 2048 * 8, 24 * 2048 * 8)
-    train_bs_extension: int = 24 * 2048 * 8
+    train_bs_schedule: tuple = (10 * 2048 * 8, 20 * 2048 * 8, 30 * 2048 * 8)
+    train_bs_extension: int = 30 * 2048 * 8
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
-    num_scheduled_iterations: int = 1560  # number of steps to complete lr and ws schedule
-    num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
+    num_scheduled_iterations: int = 1232  # number of steps to complete lr and ws schedule
+    num_extension_iterations: int = 32  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
-    cooldown_frac: float = 0.55  # fraction of num_scheduled_iterations spent cooling down the learning rate
+    cooldown_frac: float = 0.58  # fraction of num_scheduled_iterations spent cooling down the learning rate
     split_embed_frac: float = 2/3  # fraction of training when embeddings split from lm_head
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1742,10 +1825,16 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
+    # sequence length schedule
+    train_len_schedule: tuple = (256, 512, 1024, 2048)
+    len_schedule_fracs: tuple = (0.15, 0.40, 0.70)
+
     # bigram hash embedding
     bigram_vocab_size = 50304 * 5
 
 args = Hyperparameters()
+
+apply_quick_test_overrides(args)
 
 data_path = os.environ.get("DATA_PATH", ".")
 args.train_files = os.path.join(data_path, args.train_files)
@@ -1754,8 +1843,9 @@ args.val_files = os.path.join(data_path, args.val_files)
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+quick_test_world_size_ok = get_quick_test_world_size_ok(world_size)
+assert 8 % world_size == 0 or quick_test_world_size_ok, "world_size must be a divisor of 8"
+grad_accum_steps = get_grad_accum_steps(world_size)
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -1824,7 +1914,9 @@ val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1,
 
 transition_steps = training_manager.get_transition_steps()
 # first few steps plus transitions
-warmup_steps = sorted({0, 1, 2} | set(s + offset for s in transition_steps for offset in [-1, 0, 1] if s + offset >= 0)) 
+warmup_steps = get_quick_test_warmup_steps(transition_steps)
+if QUICK_TEST_MODE:
+    print0("Quick test mode: minimal warmup (step 0 only)", console=True)
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
@@ -1906,4 +1998,7 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+
+print_quick_test_success(print0)
+
 dist.destroy_process_group()
